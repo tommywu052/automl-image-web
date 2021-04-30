@@ -1,0 +1,9 @@
+-i "https://azuremlsdktestpypi.azureedge.net/automl_for_images_private_preview/"
+azureml-contrib-dataset<0.1.1
+azureml-train-core<0.1.1
+azureml-train-automl<0.1.1
+
+numpy==1.18.5
+pillow==8.0.1
+scikit-image==0.17.2
+simplification==0.5.7
