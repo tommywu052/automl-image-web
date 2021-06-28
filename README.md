@@ -13,3 +13,6 @@ web portal sample for automl image training
 4) Go to http://127.0.0.1:8080/clients/index.html
 
 ![Alt text](assets/automlimageweb.jpg?raw=true "automlweb-sample")
+
+
+5) Revised Version : ![Alt text](assets/2021-06-29_021114.jpg?raw=true "automlweb-sample")
