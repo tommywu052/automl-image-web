@@ -446,6 +446,6 @@ def clientsStatic(path):
     return send_from_directory('clients/static', path)
 
 
-port = os.getenv('PORT', '18080')
+port = os.getenv('PORT', '8080')
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(port))
