@@ -215,11 +215,22 @@ class AzAutoMLModule:
         execResult = False
         old_stdout = sys.stdout
         sys.stdout = mystdout = StringIO()
+        self.current_task = ImageTask.IMAGE_OBJECT_DETECTION
 
         if self.experiment is None:
             print('experiment is None, Please Setup Experiment first.')
         else:
             try:
+
+                if Parameters.TaskType == 'image-object-detection':
+                        self.current_task = ImageTask.IMAGE_OBJECT_DETECTION
+                if Parameters.TaskType == 'image-instance-segmentation':
+                        self.current_task = ImageTask.IMAGE_INSTANCE_SEGMENTATION
+                if Parameters.TaskType == 'image-classification':
+                        self.current_task = ImageTask.IMAGE_CLASSIFICATION
+                if Parameters.TaskType == 'image-multi-labeling':
+                        self.current_task = ImageTask.IMAGE_CLASSIFICATION_MULTILABEL
+
                 if Parameters.HyperparameterSweeping:
                     parameter_space = {
                         'model_name': choice(Parameters.ModelChoice),
@@ -233,7 +244,8 @@ class AzAutoMLModule:
                     }
 
                     if Parameters.TaskType == 'image-object-detection' or Parameters.TaskType == 'image-instance-segmentation':
-                        parameter_space['validation_metric_type'] = Parameters.ODISValidationMetricType
+                        parameter_space['validation_metric_type'] = Parameters.ODISValidationMetricType                    
+
 
                     if Parameters.ModelChoice == 'yolov5':
                         parameter_space['img_size'] = Parameters.Yolov5ImgSize
@@ -245,16 +257,16 @@ class AzAutoMLModule:
                         'policy': BanditPolicy(evaluation_interval=1, slack_factor=0.2, delay_evaluation=2)
                     }
 
-                    image_config = AutoMLImageConfig(task=Parameters.TaskType,
+                    image_config = AutoMLImageConfig(task=self.current_task,
                                                      compute_target=self.compute_target,
                                                      training_data=self.training_dataset,
                                                      validation_data=self.validation_dataset,
                                                      primary_metric='mean_average_precision',
-                                                     **tuning_settings)
+                                                     **tuning_settings,iterations=1)
                     self.automl_task_run = self.experiment.submit(image_config)
                 else:
                     image_config = AutoMLImageConfig(
-                        task=ImageTask.IMAGE_INSTANCE_SEGMENTATION,
+                        task=self.current_task,
                         compute_target=self.compute_target,
                         training_data=self.training_dataset,
                         validation_data=self.validation_dataset,
@@ -446,6 +458,6 @@ def clientsStatic(path):
     return send_from_directory('clients/static', path)
 
 
-port = os.getenv('PORT', '8080')
+port = os.getenv('PORT', '18080')
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(port))
