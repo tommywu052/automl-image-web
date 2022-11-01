@@ -14,12 +14,15 @@ from zipfile import ZipFile
 # automl
 from azureml.core.workspace import Workspace
 from azureml.core.compute import AmlCompute, ComputeTarget
+from azureml.automl.core.shared.constants import ImageTask
 from azureml.core import Experiment, Run
 from jsonl_converter import convert_mask_in_VOC_to_jsonl
-from azureml.contrib.dataset.labeled_dataset import _LabeledDatasetFactory, LabeledDatasetTask
+#from azureml.contrib.dataset.labeled_dataset import _LabeledDatasetFactory, LabeledDatasetTask
 from azureml.core import Dataset
 from azureml.train.automl import AutoMLImageConfig
-from azureml.train.hyperdrive import GridParameterSampling, choice
+from azureml.train.hyperdrive import GridParameterSampling, choice, uniform, RandomParameterSampling, \
+    BayesianParameterSampling
+from azureml.train.hyperdrive import BanditPolicy, HyperDriveConfig, PrimaryMetricGoal
 
 app = Flask(__name__, static_url_path='')
 CORS(app)
@@ -50,13 +53,19 @@ ConvertJSONLParameter = namedtuple(
     "Parameter", ["URL"]
 )
 UploadJSONLImagesToDatastoreParameter = namedtuple(
-    "Parameter", ["LocalTargetURL", "CloudTargetPath", "TrainingDatasetName", "ValidationDatasetName"]
+    "Parameter", ["UploadFlag", "LocalTargetURL", "CloudTargetPath", "TrainingDatasetName", "ValidationDatasetName"]
 )
 SubmitAutoMLTaskParameter = namedtuple(
-    "Parameter", ["TaskType", "ModelChoice"]
+    "Parameter", ["HyperparameterSweeping", "TaskType", "ModelChoice",
+                  "LearningRateMin", "LearningRateMax", "Iterations",
+                  "MaxConcurrentIterations",
+                  "NumberOfEpochs", "TrainingBatchSize", "SplitRatio", "ODISValidationMetricType", "Yolov5ImgSize"]
 )
 ExecResult = namedtuple(
     "Result", ["ExecFlag", "Msg"]
+)
+ExecResultGetSubmitStatus = namedtuple(
+    "Result", ["ExecFlag", "Msg", "StatusUrl"]
 )
 
 
@@ -93,8 +102,8 @@ class AzAutoMLModule:
         try:
             self.compute_target = self.ws.compute_targets[Parameters.ClusterName]
             print('Found existing compute target.')
-            self.compute_target.wait_for_completion(show_output=True, min_node_count=None, timeout_in_minutes=20)
             execResult = True
+            self.compute_target.wait_for_completion(show_output=True, min_node_count=None, timeout_in_minutes=20)
         except KeyError:
             print('Creating a new compute target...')
             compute_config = AmlCompute.provisioning_configuration(vm_size='Standard_NC6',
@@ -169,7 +178,8 @@ class AzAutoMLModule:
 
         try:
             ds = self.ws.get_default_datastore()
-            ds.upload(src_dir='./datasets/' + Parameters.LocalTargetURL, target_path=Parameters.CloudTargetPath)
+            if Parameters.UploadFlag:
+                ds.upload(src_dir='./datasets/' + Parameters.LocalTargetURL, target_path=Parameters.CloudTargetPath)
 
             training_dataset_name = Parameters.TrainingDatasetName  # 'odFridgeObjectsMaskTrainingDataset'
             if training_dataset_name in self.ws.datasets:
@@ -210,13 +220,48 @@ class AzAutoMLModule:
             print('experiment is None, Please Setup Experiment first.')
         else:
             try:
-                image_config = AutoMLImageConfig(
-                    task=Parameters.TaskType,
-                    compute_target=self.compute_target,
-                    training_data=self.training_dataset,
-                    validation_data=self.validation_dataset,
-                    hyperparameter_sampling=GridParameterSampling({'model_name': choice(Parameters.ModelChoice)}))
-                self.automl_task_run = self.experiment.submit(image_config)
+                if Parameters.HyperparameterSweeping:
+                    parameter_space = {
+                        'model_name': choice(Parameters.ModelChoice),
+                        'learning_rate': uniform(Parameters.LearningRateMin, Parameters.LearningRateMax),
+                        # 'warmup_cosine_lr_warmup_epochs': choice(0, 3),
+                        'optimizer': choice('sgd', 'adam', 'adamw'),
+                        'min_size': choice(600, 800),
+                        'number_of_epochs': Parameters.NumberOfEpochs,
+                        'training_batch_size': Parameters.TrainingBatchSize,
+                        'split_ratio': Parameters.SplitRatio
+                    }
+
+                    if Parameters.TaskType == 'image-object-detection' or Parameters.TaskType == 'image-instance-segmentation':
+                        parameter_space['validation_metric_type'] = Parameters.ODISValidationMetricType
+
+                    if Parameters.ModelChoice == 'yolov5':
+                        parameter_space['img_size'] = Parameters.Yolov5ImgSize
+
+                    tuning_settings = {
+                        'iterations': Parameters.Iterations,
+                        'max_concurrent_iterations': Parameters.MaxConcurrentIterations,
+                        'hyperparameter_sampling': RandomParameterSampling(parameter_space),
+                        'policy': BanditPolicy(evaluation_interval=1, slack_factor=0.2, delay_evaluation=2)
+                    }
+
+                    image_config = AutoMLImageConfig(task=Parameters.TaskType,
+                                                     compute_target=self.compute_target,
+                                                     training_data=self.training_dataset,
+                                                     validation_data=self.validation_dataset,
+                                                     primary_metric='mean_average_precision',
+                                                     **tuning_settings)
+                    self.automl_task_run = self.experiment.submit(image_config)
+                else:
+                    image_config = AutoMLImageConfig(
+                        task=ImageTask.IMAGE_INSTANCE_SEGMENTATION,
+                        compute_target=self.compute_target,
+                        training_data=self.training_dataset,
+                        validation_data=self.validation_dataset,
+                        hyperparameter_sampling=GridParameterSampling({'model_name': choice(Parameters.ModelChoice)}),
+                        iterations=1
+                    )
+                    self.automl_task_run = self.experiment.submit(image_config)
                 print(self.automl_task_run.get_status())
                 # self.automl_task_run.wait_for_completion(wait_post_processing=True)
                 execResult = True
@@ -226,8 +271,9 @@ class AzAutoMLModule:
         sys.stdout = old_stdout
         return ExecResult(execResult, mystdout.getvalue())
 
-    def exec_GetSubmitStatus(self):
+    def exec_GetSubmitStatus(self) -> ExecResultGetSubmitStatus:
         execResult = False
+        statusurl = ''
         old_stdout = sys.stdout
         sys.stdout = mystdout = StringIO()
 
@@ -236,36 +282,42 @@ class AzAutoMLModule:
         else:
             try:
                 print(self.automl_task_run.get_status())
-                print(self.automl_task_run)
-                print(self.automl_task_run.experiment.name)
+                # print(self.automl_task_run)
+                # print(self.automl_task_run.experiment.name)
                 # Running
                 # Run(Experiment: automl-image-testing,
                 # Id: AutoML_3d690755-166a-4001-98f7-8852dd7019e4,
                 # Type: automl,
                 # Status: Running)
                 print('Task run info URL:')
-                print('https://ml.azure.com/experiments/'
-                      '{ExperimentName}'
-                      '/runs/'
-                      '{ID}'
-                      '?wsid=/subscriptions/'
-                      '{SubscriptionsId}'
-                      '/resourcegroups/'
-                      '{ResourceGroupsName}'
-                      '/workspaces/'
-                      '{WorkSpaceName}'.format(
+                # print('https://ml.azure.com/experiments/'
+                #       '{ExperimentName}'
+                #       '/runs/'
+                #       '{ID}'
+                #       '?wsid=/subscriptions/'
+                #       '{SubscriptionsId}'
+                #       '/resourcegroups/'
+                #       '{ResourceGroupsName}'
+                #       '/workspaces/'
+                #       '{WorkSpaceName}'.format(
+                #     ExperimentName=self.automl_task_run.experiment.name,
+                #     ID=self.automl_task_run.id,
+                #     SubscriptionsId=self.ws.subscription_id,
+                #     ResourceGroupsName=self.ws.resource_group,
+                #     WorkSpaceName=self.ws.name
+                # ))
+                statusurl = 'https://ml.azure.com/experiments/{ExperimentName}/runs/{ID}?wsid=/subscriptions/{SubscriptionsId}/resourcegroups/{ResourceGroupsName}/workspaces/{WorkSpaceName}'.format(
                     ExperimentName=self.automl_task_run.experiment.name,
                     ID=self.automl_task_run.id,
                     SubscriptionsId=self.ws.subscription_id,
                     ResourceGroupsName=self.ws.resource_group,
-                    WorkSpaceName=self.ws.name
-                ))
+                    WorkSpaceName=self.ws.name)
                 execResult = True
             except Exception as ex:
                 print(ex)
 
         sys.stdout = old_stdout
-        return ExecResult(execResult, mystdout.getvalue())
+        return ExecResultGetSubmitStatus(execResult, mystdout.getvalue(), statusurl)
 
 
 AutoMlModule = AzAutoMLModule()
@@ -337,6 +389,7 @@ def converttojsonl():
 def uploadjsonlimagetodatastore():
     jsonbody = request.get_json()
     UploadJSONLImagesToDatastoreParameterValue = UploadJSONLImagesToDatastoreParameter(
+        jsonbody['UploadFlag'],
         jsonbody['LocalTargetURL'],
         jsonbody['CloudTargetPath'],
         jsonbody['TrainingDatasetName'],
@@ -352,8 +405,18 @@ def uploadjsonlimagetodatastore():
 def submitautomltraining():
     jsonbody = request.get_json()
     SubmitAutoMLTaskParameterValue = SubmitAutoMLTaskParameter(
+        jsonbody['HyperparameterSweeping'],
         jsonbody['TaskType'],
-        jsonbody['ModelChoice']
+        jsonbody['ModelChoice'],
+        jsonbody['LearningRateMin'],
+        jsonbody['LearningRateMax'],
+        jsonbody['Iterations'],
+        jsonbody['MaxConcurrentIterations'],
+        jsonbody['NumberOfEpochs'],
+        jsonbody['TrainingBatchSize'],
+        jsonbody['SplitRatio'],
+        jsonbody['ODISValidationMetricType'],
+        jsonbody['Yolov5ImgSize'],
     )
     global AutoMlModule
 
@@ -365,7 +428,7 @@ def submitautomltraining():
 def getsubmitstatus():
     global AutoMlModule
     result = AutoMlModule.exec_GetSubmitStatus()
-    return {'ExecFlag': result.ExecFlag, 'Msg': result.Msg}
+    return {'ExecFlag': result.ExecFlag, 'Msg': result.Msg, 'url': result.StatusUrl}
 
 
 @app.route('/datasets/<path:path>')
@@ -383,6 +446,6 @@ def clientsStatic(path):
     return send_from_directory('clients/static', path)
 
 
-port = os.getenv('PORT', '8080')
+port = os.getenv('PORT', '18080')
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(port))
